@@ -119,7 +119,7 @@ viper.AddConfigPath("$HOME/.appname")  // call multiple times to add many search
 viper.AddConfigPath(".")               // optionally look for config in the working directory
 err := viper.ReadInConfig() // Find and read the config file
 if err != nil { // Handle errors reading the config file
-	panic(fmt.Errorf("Fatal error config file: %s \n", err))
+	panic(fmt.Errorf("Fatal error config file: %w \n", err))
 }
 ```
 
@@ -777,6 +777,15 @@ if err != nil {
 ```
 
 Viper uses [github.com/mitchellh/mapstructure](https://github.com/mitchellh/mapstructure) under the hood for unmarshaling values which uses `mapstructure` tags by default.
+
+### Decoding custom formats
+
+A frequently requested feature for Viper is adding more value formats and decoders.
+For example, parsing character (dot, comma, semicolon, etc) separated strings into slices.
+
+This is already available in Viper using mapstructure decode hooks.
+
+Read more about the details in [this blog post](https://sagikazarmark.hu/blog/decoding-custom-formats-with-viper/).
 
 ### Marshalling to string
 

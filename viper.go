@@ -22,7 +22,6 @@ package viper
 import (
 	"bytes"
 	"encoding/csv"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,18 +35,20 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/hashicorp/hcl"
-	"github.com/hashicorp/hcl/hcl/printer"
 	"github.com/magiconair/properties"
 	"github.com/mitchellh/mapstructure"
-	"github.com/pelletier/go-toml"
 	"github.com/spf13/afero"
 	"github.com/spf13/cast"
 	jww "github.com/spf13/jwalterweatherman"
 	"github.com/spf13/pflag"
 	"github.com/subosito/gotenv"
 	"gopkg.in/ini.v1"
-	"gopkg.in/yaml.v2"
+
+	"github.com/spf13/viper/internal/encoding"
+	"github.com/spf13/viper/internal/encoding/hcl"
+	"github.com/spf13/viper/internal/encoding/json"
+	"github.com/spf13/viper/internal/encoding/toml"
+	"github.com/spf13/viper/internal/encoding/yaml"
 )
 
 // ConfigMarshalError happens when failing to marshal the configuration.
@@ -67,8 +68,44 @@ type RemoteResponse struct {
 	Error error
 }
 
+var (
+	encoderRegistry = encoding.NewEncoderRegistry()
+	decoderRegistry = encoding.NewDecoderRegistry()
+)
+
 func init() {
 	v = New()
+
+	{
+		codec := yaml.Codec{}
+
+		encoderRegistry.RegisterEncoder("yaml", codec)
+		decoderRegistry.RegisterDecoder("yaml", codec)
+
+		encoderRegistry.RegisterEncoder("yml", codec)
+		decoderRegistry.RegisterDecoder("yml", codec)
+	}
+
+	{
+		codec := json.Codec{}
+
+		encoderRegistry.RegisterEncoder("json", codec)
+		decoderRegistry.RegisterDecoder("json", codec)
+	}
+
+	{
+		codec := toml.Codec{}
+
+		encoderRegistry.RegisterEncoder("toml", codec)
+		decoderRegistry.RegisterDecoder("toml", codec)
+	}
+
+	{
+		codec := hcl.Codec{}
+
+		encoderRegistry.RegisterEncoder("hcl", codec)
+		decoderRegistry.RegisterDecoder("hcl", codec)
+	}
 }
 
 type remoteConfigFactory interface {
@@ -198,6 +235,9 @@ type Viper struct {
 	configType        string
 	configPermissions os.FileMode
 	envPrefix         string
+
+	// Specific commands for ini parsing
+	iniLoadOptions ini.LoadOptions
 
 	automaticEnvApplied bool
 	envKeyReplacer      StringReplacer
@@ -344,7 +384,7 @@ func (v *Viper) WatchConfig() {
 	initWG := sync.WaitGroup{}
 	initWG.Add(1)
 	go func() {
-		watcher, err := fsnotify.NewWatcher()
+		watcher, err := newWatcher()
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1150,7 +1190,7 @@ func (v *Viper) find(lcaseKey string, flagDefault bool) interface{} {
 			return cast.ToInt(flag.ValueString())
 		case "bool":
 			return cast.ToBool(flag.ValueString())
-		case "stringSlice":
+		case "stringSlice", "stringArray":
 			s := strings.TrimPrefix(flag.ValueString(), "[")
 			s = strings.TrimSuffix(s, "]")
 			res, _ := readAsCSV(s)
@@ -1229,7 +1269,7 @@ func (v *Viper) find(lcaseKey string, flagDefault bool) interface{} {
 				return cast.ToInt(flag.ValueString())
 			case "bool":
 				return cast.ToBool(flag.ValueString())
-			case "stringSlice":
+			case "stringSlice", "stringArray":
 				s := strings.TrimPrefix(flag.ValueString(), "[")
 				s = strings.TrimSuffix(s, "]")
 				res, _ := readAsCSV(s)
@@ -1581,34 +1621,11 @@ func (v *Viper) unmarshalReader(in io.Reader, c map[string]interface{}) error {
 	buf := new(bytes.Buffer)
 	buf.ReadFrom(in)
 
-	switch strings.ToLower(v.getConfigType()) {
-	case "yaml", "yml":
-		if err := yaml.Unmarshal(buf.Bytes(), &c); err != nil {
-			return ConfigParseError{err}
-		}
-
-	case "json":
-		if err := json.Unmarshal(buf.Bytes(), &c); err != nil {
-			return ConfigParseError{err}
-		}
-
-	case "hcl":
-		obj, err := hcl.Parse(buf.String())
+	switch format := strings.ToLower(v.getConfigType()); format {
+	case "yaml", "yml", "json", "toml", "hcl":
+		err := decoderRegistry.Decode(format, buf.Bytes(), &c)
 		if err != nil {
 			return ConfigParseError{err}
-		}
-		if err = hcl.DecodeObject(&c, obj); err != nil {
-			return ConfigParseError{err}
-		}
-
-	case "toml":
-		tree, err := toml.LoadReader(buf)
-		if err != nil {
-			return ConfigParseError{err}
-		}
-		tmap := tree.ToMap()
-		for k, v := range tmap {
-			c[k] = v
 		}
 
 	case "dotenv", "env":
@@ -1637,7 +1654,7 @@ func (v *Viper) unmarshalReader(in io.Reader, c map[string]interface{}) error {
 		}
 
 	case "ini":
-		cfg := ini.Empty()
+		cfg := ini.Empty(v.iniLoadOptions)
 		err := cfg.Append(buf.Bytes())
 		if err != nil {
 			return ConfigParseError{err}
@@ -1662,26 +1679,13 @@ func (v *Viper) unmarshalReader(in io.Reader, c map[string]interface{}) error {
 func (v *Viper) marshalWriter(f afero.File, configType string) error {
 	c := v.AllSettings()
 	switch configType {
-	case "json":
-		b, err := json.MarshalIndent(c, "", "  ")
-		if err != nil {
-			return ConfigMarshalError{err}
-		}
-		_, err = f.WriteString(string(b))
+	case "yaml", "yml", "json", "toml", "hcl":
+		b, err := encoderRegistry.Encode(configType, c)
 		if err != nil {
 			return ConfigMarshalError{err}
 		}
 
-	case "hcl":
-		b, err := json.Marshal(c)
-		if err != nil {
-			return ConfigMarshalError{err}
-		}
-		ast, err := hcl.Parse(string(b))
-		if err != nil {
-			return ConfigMarshalError{err}
-		}
-		err = printer.Fprint(f, ast.Node)
+		_, err = f.WriteString(string(b))
 		if err != nil {
 			return ConfigMarshalError{err}
 		}
@@ -1711,25 +1715,6 @@ func (v *Viper) marshalWriter(f afero.File, configType string) error {
 		}
 		s := strings.Join(lines, "\n")
 		if _, err := f.WriteString(s); err != nil {
-			return ConfigMarshalError{err}
-		}
-
-	case "toml":
-		t, err := toml.TreeFromMap(c)
-		if err != nil {
-			return ConfigMarshalError{err}
-		}
-		s := t.String()
-		if _, err := f.WriteString(s); err != nil {
-			return ConfigMarshalError{err}
-		}
-
-	case "yaml", "yml":
-		b, err := yaml.Marshal(c)
-		if err != nil {
-			return ConfigMarshalError{err}
-		}
-		if _, err = f.WriteString(string(b)); err != nil {
 			return ConfigMarshalError{err}
 		}
 
@@ -1826,7 +1811,7 @@ func mergeMaps(
 
 		svType := reflect.TypeOf(sv)
 		tvType := reflect.TypeOf(tv)
-		if svType != tvType {
+		if tvType != nil && svType != tvType { // Allow for the target to be nil
 			jww.ERROR.Printf(
 				"svType != tvType; key=%s, st=%v, tt=%v, sv=%v, tv=%v",
 				sk, svType, tvType, sv, tv)
@@ -2079,6 +2064,13 @@ func SetConfigPermissions(perm os.FileMode) { v.SetConfigPermissions(perm) }
 
 func (v *Viper) SetConfigPermissions(perm os.FileMode) {
 	v.configPermissions = perm.Perm()
+}
+
+// IniLoadOptions sets the load options for ini parsing.
+func IniLoadOptions(in ini.LoadOptions) Option {
+	return optionFunc(func(v *Viper) {
+		v.iniLoadOptions = in
+	})
 }
 
 func (v *Viper) getConfigType() string {
