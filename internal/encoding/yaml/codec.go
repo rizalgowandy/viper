@@ -1,14 +1,16 @@
 package yaml
 
-import "gopkg.in/yaml.v2"
+import "go.yaml.in/yaml/v3"
 
 // Codec implements the encoding.Encoder and encoding.Decoder interfaces for YAML encoding.
 type Codec struct{}
 
-func (Codec) Encode(v interface{}) ([]byte, error) {
+// Encode encodes a map[string]any into a YAML byte slice.
+func (Codec) Encode(v map[string]any) ([]byte, error) {
 	return yaml.Marshal(v)
 }
 
-func (Codec) Decode(b []byte, v interface{}) error {
-	return yaml.Unmarshal(b, v)
+// Decode decodes a YAML byte slice into a map[string]any.
+func (Codec) Decode(b []byte, v map[string]any) error {
+	return yaml.Unmarshal(b, &v)
 }
